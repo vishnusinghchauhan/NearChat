@@ -503,3 +503,16 @@ footer {
     padding: 0 15px;
   }
 }
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.online-count {
+  font-size: 13px;
+  color: #4b5563;
+  background: #f3f4f6;
+  border-radius: 999px;
+  padding: 7px 10px;
+}

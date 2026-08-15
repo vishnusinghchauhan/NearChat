@@ -8,82 +8,52 @@ const PORT = Number(process.env.PORT || 4000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
 
 const app = express();
-app.use(cors({ origin: CLIENT_ORIGIN }));
+
+const allowedOrigins = CLIENT_ORIGIN === "*"
+  ? true
+  : CLIENT_ORIGIN.split(",").map((v) => v.trim()).filter(Boolean);
+
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: "10kb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "near-chat-server", time: new Date().toISOString() });
+  res.json({
+    ok: true,
+    service: "near-chat-server",
+    onlineUsers: users.size,
+    waitingUsers: waiting.size,
+    activeChats: rooms.size,
+    time: new Date().toISOString()
+  });
 });
 
 const httpServer = http.createServer(app);
 
 const io = new Server(httpServer, {
   cors: {
-    origin: CLIENT_ORIGIN,
+    origin: allowedOrigins,
     methods: ["GET", "POST"]
-  }
+  },
+  transports: ["websocket", "polling"],
+  pingInterval: 25000,
+  pingTimeout: 20000
 });
 
-// In-memory MVP state.
-// Replace with Redis/MongoDB for production and multiple server instances.
+// This server supports many simultaneous users on one Render instance.
+// For horizontal scaling across multiple server instances, add Redis later.
 const users = new Map();       // socketId -> user
-const waiting = new Set();     // socket IDs currently waiting
+const waiting = new Set();     // socket IDs waiting for a stranger
 const rooms = new Map();       // roomId -> Set(socketId)
 const blocked = new Map();     // socketId -> Set(socketId)
 const reports = [];
+const lastMessageAt = new Map();
 
-const SEARCH_STEPS_KM = [5, 25, 100];
-
-function isFiniteCoordinate(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function validateLocation(location) {
-  return (
-    location &&
-    isFiniteCoordinate(location.lat) &&
-    isFiniteCoordinate(location.lng) &&
-    location.lat >= -90 &&
-    location.lat <= 90 &&
-    location.lng >= -180 &&
-    location.lng <= 180
-  );
-}
-
-function haversineKm(a, b) {
-  const R = 6371;
-  const lat1 = (a.lat * Math.PI) / 180;
-  const lat2 = (b.lat * Math.PI) / 180;
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
-
-  const h =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
-
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-function makeRoomId() {
+function roomId() {
   return `room_${crypto.randomUUID()}`;
 }
 
-function removeFromRoom(socketId) {
-  const user = users.get(socketId);
-  if (!user?.roomId) return null;
-
-  const roomId = user.roomId;
-  const room = rooms.get(roomId);
-
-  if (room) {
-    room.delete(socketId);
-    if (room.size === 0) {
-      rooms.delete(roomId);
-    }
-  }
-
-  user.roomId = null;
-  return roomId;
+function emitOnlineCount() {
+  io.emit("online-count", users.size);
 }
 
 function getPartner(socketId) {
@@ -96,44 +66,80 @@ function getPartner(socketId) {
   for (const id of room) {
     if (id !== socketId) return id;
   }
-
   return null;
 }
 
-function canMatch(a, b) {
-  if (!a || !b || a.id === b.id) return false;
-  if (!a.location || !b.location) return false;
-  if (a.roomId || b.roomId) return false;
+function leaveRoom(socketId, notifyPartner = true) {
+  const user = users.get(socketId);
+  if (!user?.roomId) return null;
 
-  const aBlocks = blocked.get(a.id) || new Set();
-  const bBlocks = blocked.get(b.id) || new Set();
+  const currentRoom = user.roomId;
+  const partnerId = getPartner(socketId);
+  const room = rooms.get(currentRoom);
 
-  return !aBlocks.has(b.id) && !bBlocks.has(a.id);
+  if (room) {
+    room.delete(socketId);
+    if (room.size === 0) rooms.delete(currentRoom);
+  }
+
+  user.roomId = null;
+  user.searching = false;
+
+  const socket = io.sockets.sockets.get(socketId);
+  socket?.leave(currentRoom);
+
+  if (notifyPartner && partnerId) {
+    const partner = users.get(partnerId);
+    if (partner) partner.roomId = null;
+
+    const partnerSocket = io.sockets.sockets.get(partnerId);
+    partnerSocket?.leave(currentRoom);
+    partnerSocket?.emit("partner-left");
+  }
+
+  return { roomId: currentRoom, partnerId };
 }
 
-function chooseNearest(socketId, maxDistanceKm = Infinity) {
-  const user = users.get(socketId);
-  if (!user?.location) return null;
+function isBlocked(a, b) {
+  const aBlocks = blocked.get(a) || new Set();
+  const bBlocks = blocked.get(b) || new Set();
+  return aBlocks.has(b) || bBlocks.has(a);
+}
 
-  let best = null;
+function canMatch(a, b) {
+  return Boolean(
+    a &&
+    b &&
+    a.id !== b.id &&
+    !a.roomId &&
+    !b.roomId &&
+    waiting.has(a.id) &&
+    waiting.has(b.id) &&
+    !isBlocked(a.id, b.id)
+  );
+}
 
-  for (const candidateId of waiting) {
-    if (candidateId === socketId) continue;
+function findRandomPartner(socketId) {
+  const current = users.get(socketId);
+  if (!current) return null;
 
-    const candidate = users.get(candidateId);
-    if (!canMatch(user, candidate)) continue;
+  const candidates = [];
 
-    const distance = haversineKm(user.location, candidate.location);
+  for (const id of waiting) {
+    if (id === socketId) continue;
+    const candidate = users.get(id);
 
-    if (distance <= maxDistanceKm && (!best || distance < best.distance)) {
-      best = { candidate, distance };
+    if (canMatch(current, candidate)) {
+      candidates.push(candidate);
     }
   }
 
-  return best;
+  if (!candidates.length) return null;
+
+  return candidates[Math.floor(Math.random() * candidates.length)];
 }
 
-function matchUsers(aId, bId, distanceKm) {
+function matchUsers(aId, bId) {
   const a = users.get(aId);
   const b = users.get(bId);
 
@@ -142,48 +148,50 @@ function matchUsers(aId, bId, distanceKm) {
   waiting.delete(aId);
   waiting.delete(bId);
 
-  const roomId = makeRoomId();
-  rooms.set(roomId, new Set([aId, bId]));
+  a.searching = false;
+  b.searching = false;
 
-  a.roomId = roomId;
-  b.roomId = roomId;
+  const newRoom = roomId();
+
+  rooms.set(newRoom, new Set([aId, bId]));
+  a.roomId = newRoom;
+  b.roomId = newRoom;
 
   const aSocket = io.sockets.sockets.get(aId);
   const bSocket = io.sockets.sockets.get(bId);
 
-  aSocket?.join(roomId);
-  bSocket?.join(roomId);
+  aSocket?.join(newRoom);
+  bSocket?.join(newRoom);
 
-  aSocket?.emit("matched", {
-    roomId,
-    approximateDistanceKm: Math.round(distanceKm * 10) / 10
-  });
-
-  bSocket?.emit("matched", {
-    roomId,
-    approximateDistanceKm: Math.round(distanceKm * 10) / 10
-  });
+  aSocket?.emit("matched", { roomId: newRoom });
+  bSocket?.emit("matched", { roomId: newRoom });
 
   return true;
 }
 
 function tryMatch(socketId) {
-  const user = users.get(socketId);
-  if (!user?.location || user.roomId) return false;
+  const partner = findRandomPartner(socketId);
 
-  // First: strict nearby radius.
-  for (const radius of SEARCH_STEPS_KM) {
-    const match = chooseNearest(socketId, radius);
-    if (match) {
-      return matchUsers(socketId, match.candidate.id, match.distance);
-    }
+  if (!partner) return false;
+
+  return matchUsers(socketId, partner.id);
+}
+
+function startSearching(socket) {
+  const user = users.get(socket.id);
+
+  if (!user) return false;
+
+  waiting.add(socket.id);
+  user.searching = true;
+
+  if (tryMatch(socket.id)) {
+    return true;
   }
 
-  // Finally: global fallback.
-  const match = chooseNearest(socketId, Infinity);
-  if (match) {
-    return matchUsers(socketId, match.candidate.id, match.distance);
-  }
+  socket.emit("searching", {
+    message: `Searching ${waiting.size} people waiting for a chat...`
+  });
 
   return false;
 }
@@ -191,43 +199,23 @@ function tryMatch(socketId) {
 io.on("connection", (socket) => {
   users.set(socket.id, {
     id: socket.id,
-    location: null,
     roomId: null,
     searching: false,
     connectedAt: Date.now()
   });
 
   blocked.set(socket.id, new Set());
+  emitOnlineCount();
 
-  socket.emit("ready", { socketId: socket.id });
-
-  socket.on("set-location", (payload, callback) => {
-    const user = users.get(socket.id);
-
-    if (!user) return;
-    if (!validateLocation(payload)) {
-      callback?.({ ok: false, error: "Invalid location." });
-      return;
-    }
-
-    // Only store coordinates server-side for matching.
-    // Never send these coordinates to another user.
-    user.location = {
-      lat: Number(payload.lat),
-      lng: Number(payload.lng),
-      countryCode: typeof payload.countryCode === "string"
-        ? payload.countryCode.slice(0, 2).toUpperCase()
-        : null
-    };
-
-    callback?.({ ok: true });
+  socket.emit("ready", {
+    socketId: socket.id
   });
 
   socket.on("find-stranger", (callback) => {
     const user = users.get(socket.id);
 
-    if (!user?.location) {
-      callback?.({ ok: false, error: "Location is required before matching." });
+    if (!user) {
+      callback?.({ ok: false, error: "Session not found." });
       return;
     }
 
@@ -236,72 +224,42 @@ io.on("connection", (socket) => {
       return;
     }
 
-    user.searching = true;
-    waiting.add(socket.id);
+    if (waiting.has(socket.id)) {
+      callback?.({ ok: true, searching: true });
+      return;
+    }
 
-    const matched = tryMatch(socket.id);
+    const matched = startSearching(socket);
 
     callback?.({
       ok: true,
       searching: !matched
     });
-
-    if (!matched) {
-      socket.emit("searching", { message: "Looking for someone nearby..." });
-    }
   });
 
   socket.on("next", () => {
     const user = users.get(socket.id);
     if (!user) return;
 
-    const oldRoomId = user.roomId;
-    const partnerId = getPartner(socket.id);
+    waiting.delete(socket.id);
 
-    if (oldRoomId) {
-      removeFromRoom(socket.id);
-
-      if (partnerId) {
-        const partner = users.get(partnerId);
-        if (partner) partner.roomId = null;
-
-        const partnerSocket = io.sockets.sockets.get(partnerId);
-        partnerSocket?.leave(oldRoomId);
-        partnerSocket?.emit("partner-left");
-      }
-
-      socket.leave(oldRoomId);
+    if (user.roomId) {
+      leaveRoom(socket.id, true);
       socket.emit("chat-ended");
     }
 
-    user.searching = true;
-    waiting.add(socket.id);
-
-    if (!tryMatch(socket.id)) {
-      socket.emit("searching", { message: "Looking for another person..." });
-    }
+    startSearching(socket);
   });
 
   socket.on("leave", () => {
     const user = users.get(socket.id);
     if (!user) return;
 
-    const partnerId = getPartner(socket.id);
-    const roomId = user.roomId;
-
-    removeFromRoom(socket.id);
     waiting.delete(socket.id);
     user.searching = false;
 
-    if (roomId) socket.leave(roomId);
-
-    if (partnerId) {
-      const partner = users.get(partnerId);
-      if (partner) partner.roomId = null;
-
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      partnerSocket?.leave(roomId);
-      partnerSocket?.emit("partner-left");
+    if (user.roomId) {
+      leaveRoom(socket.id, true);
     }
 
     socket.emit("chat-ended");
@@ -309,12 +267,24 @@ io.on("connection", (socket) => {
 
   socket.on("message", (payload, callback) => {
     const user = users.get(socket.id);
+
     if (!user?.roomId) {
       callback?.({ ok: false, error: "You are not in a chat." });
       return;
     }
 
-    const text = typeof payload?.text === "string" ? payload.text.trim() : "";
+    const now = Date.now();
+    const previous = lastMessageAt.get(socket.id) || 0;
+
+    if (now - previous < 350) {
+      callback?.({ ok: false, error: "Please slow down." });
+      return;
+    }
+
+    const text =
+      typeof payload?.text === "string"
+        ? payload.text.trim()
+        : "";
 
     if (!text) {
       callback?.({ ok: false, error: "Message is empty." });
@@ -322,9 +292,14 @@ io.on("connection", (socket) => {
     }
 
     if (text.length > 1000) {
-      callback?.({ ok: false, error: "Message is too long." });
+      callback?.({
+        ok: false,
+        error: "Message cannot exceed 1000 characters."
+      });
       return;
     }
+
+    lastMessageAt.set(socket.id, now);
 
     io.to(user.roomId).emit("message", {
       id: crypto.randomUUID(),
@@ -336,43 +311,12 @@ io.on("connection", (socket) => {
     callback?.({ ok: true });
   });
 
-  socket.on("typing", (isTyping) => {
+  socket.on("typing", (value) => {
     const user = users.get(socket.id);
+
     if (!user?.roomId) return;
 
-    socket.to(user.roomId).emit("typing", Boolean(isTyping));
-  });
-
-  socket.on("block", () => {
-    const user = users.get(socket.id);
-    const partnerId = getPartner(socket.id);
-
-    if (!user || !partnerId) return;
-
-    const set = blocked.get(socket.id) || new Set();
-    set.add(partnerId);
-    blocked.set(socket.id, set);
-
-    socket.emit("blocked");
-
-    // End current chat and immediately look for another person.
-    const roomId = user.roomId;
-    removeFromRoom(socket.id);
-
-    const partner = users.get(partnerId);
-    if (partner) partner.roomId = null;
-
-    const partnerSocket = io.sockets.sockets.get(partnerId);
-    partnerSocket?.leave(roomId);
-    partnerSocket?.emit("partner-left");
-
-    socket.leave(roomId);
-    user.searching = true;
-    waiting.add(socket.id);
-
-    if (!tryMatch(socket.id)) {
-      socket.emit("searching", { message: "Looking for another person..." });
-    }
+    socket.to(user.roomId).emit("typing", Boolean(value));
   });
 
   socket.on("report", (payload) => {
@@ -381,45 +325,55 @@ io.on("connection", (socket) => {
 
     if (!user || !partnerId) return;
 
-    const reason =
-      typeof payload?.reason === "string"
-        ? payload.reason.slice(0, 200)
-        : "No reason provided";
-
     reports.push({
       id: crypto.randomUUID(),
       reporter: socket.id,
       reported: partnerId,
-      reason,
+      reason:
+        typeof payload?.reason === "string"
+          ? payload.reason.slice(0, 200)
+          : "No reason provided",
       createdAt: new Date().toISOString()
     });
 
     socket.emit("reported");
   });
 
+  socket.on("block", () => {
+    const partnerId = getPartner(socket.id);
+
+    if (!partnerId) return;
+
+    const set = blocked.get(socket.id) || new Set();
+    set.add(partnerId);
+    blocked.set(socket.id, set);
+
+    leaveRoom(socket.id, true);
+
+    socket.emit("blocked");
+
+    startSearching(socket);
+  });
+
   socket.on("disconnect", () => {
     const user = users.get(socket.id);
+
     if (!user) return;
 
-    const partnerId = getPartner(socket.id);
-    const roomId = user.roomId;
-
     waiting.delete(socket.id);
-    removeFromRoom(socket.id);
+
+    if (user.roomId) {
+      leaveRoom(socket.id, true);
+    }
+
     blocked.delete(socket.id);
+    lastMessageAt.delete(socket.id);
     users.delete(socket.id);
 
-    if (roomId && partnerId) {
-      const partner = users.get(partnerId);
-      if (partner) partner.roomId = null;
-
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      partnerSocket?.leave(roomId);
-      partnerSocket?.emit("partner-left");
-    }
+    emitOnlineCount();
   });
 });
 
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`NearChat server running on http://localhost:${PORT}`);
+  console.log(`NearChat server listening on ${PORT}`);
 });
