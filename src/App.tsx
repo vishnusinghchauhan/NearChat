@@ -21,13 +21,15 @@ export default function App() {
   const [typing, setTyping] = useState(false);
   const [error, setError] = useState("");
   const [info, setInfo] = useState("");
+  const [distance, setDistance] = useState<number | null>(null);
+  const [locationReady, setLocationReady] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
   const [reportReason, setReportReason] = useState("Inappropriate behavior");
 
   const mySocketId = socketRef.current?.id;
 
   const statusText = useMemo(() => {
-    if (status === "searching") return "Looking for an online stranger...";
+    if (status === "searching") return "Looking for someone nearby...";
     if (status === "chatting") return "Connected to a stranger";
     return "Ready to meet someone new";
   }, [status]);
@@ -41,22 +43,29 @@ export default function App() {
 
     socket.on("connect", () => {
       setError("");
+      requestLocation(socket);
     });
 
     socket.on("connect_error", () => {
       setError("Could not connect to the chat server.");
     });
 
-    socket.on("matched", () => {
+    socket.on("matched", (data: { approximateDistanceKm?: number }) => {
       setStatus("chatting");
       setMessages([]);
       setTyping(false);
-      setInfo("You are connected with a random online stranger.");
+      setInfo("You found someone nearby.");
+      setDistance(
+        typeof data.approximateDistanceKm === "number"
+          ? data.approximateDistanceKm
+          : null
+      );
     });
 
     socket.on("searching", (data: { message?: string }) => {
       setStatus("searching");
       setInfo(data.message || "Searching...");
+      setDistance(null);
     });
 
     socket.on("message", (msg: Message) => {
@@ -70,12 +79,14 @@ export default function App() {
     socket.on("partner-left", () => {
       setStatus("home");
       setInfo("The stranger left the chat.");
+      setDistance(null);
       setTyping(false);
     });
 
     socket.on("chat-ended", () => {
       setStatus("home");
       setMessages([]);
+      setDistance(null);
       setTyping(false);
     });
 
@@ -100,6 +111,49 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  function requestLocation(socket: Socket) {
+    if (!navigator.geolocation) {
+      setError("Your browser does not support location services.");
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        // We send coordinates only to our server for matching.
+        // The server never sends exact coordinates to another user.
+        socket.emit(
+          "set-location",
+          {
+            lat: position.coords.latitude,
+            lng: position.coords.longitude
+          },
+          (result: { ok: boolean; error?: string }) => {
+            if (!result?.ok) {
+              setError(result?.error || "Could not set location.");
+              return;
+            }
+            setLocationReady(true);
+            setError("");
+          }
+        );
+      },
+      (geoError) => {
+        if (geoError.code === geoError.PERMISSION_DENIED) {
+          setError(
+            "Location permission is required because this app matches nearby people."
+          );
+        } else {
+          setError("Could not determine your location.");
+        }
+      },
+      {
+        enableHighAccuracy: false,
+        maximumAge: 5 * 60 * 1000,
+        timeout: 10000
+      }
+    );
+  }
+
   function findStranger() {
     const socket = socketRef.current;
 
@@ -108,8 +162,13 @@ export default function App() {
       return;
     }
 
+    if (!locationReady) {
+      requestLocation(socket);
+      return;
+    }
+
     setError("");
-    setInfo("Searching all online users...");
+    setInfo("Searching...");
     setStatus("searching");
 
     socket.emit(
@@ -199,19 +258,20 @@ export default function App() {
 
         {status === "home" && (
           <section className="hero card">
-            <div className="hero-icon">🌎</div>
-            <h1>Chat with a random online stranger</h1>
+            <div className="hero-icon">📍</div>
+            <h1>Chat with someone nearby</h1>
             <p>
-              NearChat connects you with any available online person.
-              There is no location filter, so you can meet people from anywhere.
+              NearChat finds an available stranger close to your location
+              first, then expands the search when nobody nearby is available.
             </p>
 
             <div className="privacy">
               <span>🔒</span>
               <div>
-                <strong>No location required</strong>
+                <strong>Your exact location stays private</strong>
                 <small>
-                  We do not request or use your device location for matching.
+                  Location is used only by the server for matching. Other
+                  users never receive your coordinates.
                 </small>
               </div>
             </div>
@@ -219,9 +279,19 @@ export default function App() {
             <button
               className="primary-button"
               onClick={findStranger}
+              disabled={!locationReady}
             >
-              Find Random Stranger
+              {locationReady ? "Find Stranger" : "Allow Location First"}
             </button>
+
+            {!locationReady && (
+              <button
+                className="link-button"
+                onClick={() => socketRef.current && requestLocation(socketRef.current)}
+              >
+                Request location permission
+              </button>
+            )}
 
             <div className="rules">
               <span>Be respectful</span>
@@ -238,8 +308,8 @@ export default function App() {
             <div className="loader" />
             <h2>Finding a stranger</h2>
             <p>
-              We are looking for any available online person. As soon as
-              another person joins the queue, you can be matched.
+              We are looking for someone nearby. If nobody is available,
+              we'll gradually expand the search.
             </p>
             <button className="secondary-button" onClick={leaveChat}>
               Cancel

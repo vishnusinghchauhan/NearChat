@@ -12,11 +12,7 @@ app.use(cors({ origin: CLIENT_ORIGIN }));
 app.use(express.json({ limit: "10kb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "near-chat-server",
-    time: new Date().toISOString()
-  });
+  res.json({ ok: true, service: "near-chat-server", time: new Date().toISOString() });
 });
 
 const httpServer = http.createServer(app);
@@ -28,16 +24,66 @@ const io = new Server(httpServer, {
   }
 });
 
-// Simple MVP state. For production use Redis for matching and a database
-// for reports/block lists.
+// In-memory MVP state.
+// Replace with Redis/MongoDB for production and multiple server instances.
 const users = new Map();       // socketId -> user
 const waiting = new Set();     // socket IDs currently waiting
 const rooms = new Map();       // roomId -> Set(socketId)
 const blocked = new Map();     // socketId -> Set(socketId)
 const reports = [];
 
+const SEARCH_STEPS_KM = [5, 25, 100];
+
+function isFiniteCoordinate(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function validateLocation(location) {
+  return (
+    location &&
+    isFiniteCoordinate(location.lat) &&
+    isFiniteCoordinate(location.lng) &&
+    location.lat >= -90 &&
+    location.lat <= 90 &&
+    location.lng >= -180 &&
+    location.lng <= 180
+  );
+}
+
+function haversineKm(a, b) {
+  const R = 6371;
+  const lat1 = (a.lat * Math.PI) / 180;
+  const lat2 = (b.lat * Math.PI) / 180;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLng / 2) ** 2;
+
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
 function makeRoomId() {
   return `room_${crypto.randomUUID()}`;
+}
+
+function removeFromRoom(socketId) {
+  const user = users.get(socketId);
+  if (!user?.roomId) return null;
+
+  const roomId = user.roomId;
+  const room = rooms.get(roomId);
+
+  if (room) {
+    room.delete(socketId);
+    if (room.size === 0) {
+      rooms.delete(roomId);
+    }
+  }
+
+  user.roomId = null;
+  return roomId;
 }
 
 function getPartner(socketId) {
@@ -54,26 +100,10 @@ function getPartner(socketId) {
   return null;
 }
 
-function removeFromRoom(socketId) {
-  const user = users.get(socketId);
-  if (!user?.roomId) return null;
-
-  const roomId = user.roomId;
-  const room = rooms.get(roomId);
-
-  if (room) {
-    room.delete(socketId);
-    if (room.size === 0) rooms.delete(roomId);
-  }
-
-  user.roomId = null;
-  return roomId;
-}
-
 function canMatch(a, b) {
   if (!a || !b || a.id === b.id) return false;
+  if (!a.location || !b.location) return false;
   if (a.roomId || b.roomId) return false;
-  if (!waiting.has(a.id) || !waiting.has(b.id)) return false;
 
   const aBlocks = blocked.get(a.id) || new Set();
   const bBlocks = blocked.get(b.id) || new Set();
@@ -81,31 +111,29 @@ function canMatch(a, b) {
   return !aBlocks.has(b.id) && !bBlocks.has(a.id);
 }
 
-function findRandomWaitingPartner(socketId) {
+function chooseNearest(socketId, maxDistanceKm = Infinity) {
   const user = users.get(socketId);
-  if (!user) return null;
+  if (!user?.location) return null;
 
-  const candidates = [];
+  let best = null;
 
   for (const candidateId of waiting) {
     if (candidateId === socketId) continue;
 
     const candidate = users.get(candidateId);
-    if (canMatch(user, candidate)) {
-      candidates.push(candidate);
+    if (!canMatch(user, candidate)) continue;
+
+    const distance = haversineKm(user.location, candidate.location);
+
+    if (distance <= maxDistanceKm && (!best || distance < best.distance)) {
+      best = { candidate, distance };
     }
   }
 
-  if (!candidates.length) return null;
-
-  // Randomize so the same person is not always selected first.
-  const candidate =
-    candidates[Math.floor(Math.random() * candidates.length)];
-
-  return candidate;
+  return best;
 }
 
-function matchUsers(aId, bId) {
+function matchUsers(aId, bId, distanceKm) {
   const a = users.get(aId);
   const b = users.get(bId);
 
@@ -113,9 +141,6 @@ function matchUsers(aId, bId) {
 
   waiting.delete(aId);
   waiting.delete(bId);
-
-  a.searching = false;
-  b.searching = false;
 
   const roomId = makeRoomId();
   rooms.set(roomId, new Set([aId, bId]));
@@ -129,43 +154,44 @@ function matchUsers(aId, bId) {
   aSocket?.join(roomId);
   bSocket?.join(roomId);
 
-  aSocket?.emit("matched", { roomId });
-  bSocket?.emit("matched", { roomId });
+  aSocket?.emit("matched", {
+    roomId,
+    approximateDistanceKm: Math.round(distanceKm * 10) / 10
+  });
+
+  bSocket?.emit("matched", {
+    roomId,
+    approximateDistanceKm: Math.round(distanceKm * 10) / 10
+  });
 
   return true;
 }
 
 function tryMatch(socketId) {
   const user = users.get(socketId);
-  if (!user || user.roomId || !waiting.has(socketId)) return false;
+  if (!user?.location || user.roomId) return false;
 
-  const partner = findRandomWaitingPartner(socketId);
-  if (!partner) return false;
-
-  return matchUsers(socketId, partner.id);
-}
-
-function startSearching(socket) {
-  const user = users.get(socket.id);
-  if (!user) return false;
-
-  user.searching = true;
-  waiting.add(socket.id);
-
-  const matched = tryMatch(socket.id);
-
-  if (!matched) {
-    socket.emit("searching", {
-      message: "Looking for an online stranger..."
-    });
+  // First: strict nearby radius.
+  for (const radius of SEARCH_STEPS_KM) {
+    const match = chooseNearest(socketId, radius);
+    if (match) {
+      return matchUsers(socketId, match.candidate.id, match.distance);
+    }
   }
 
-  return matched;
+  // Finally: global fallback.
+  const match = chooseNearest(socketId, Infinity);
+  if (match) {
+    return matchUsers(socketId, match.candidate.id, match.distance);
+  }
+
+  return false;
 }
 
 io.on("connection", (socket) => {
   users.set(socket.id, {
     id: socket.id,
+    location: null,
     roomId: null,
     searching: false,
     connectedAt: Date.now()
@@ -175,11 +201,33 @@ io.on("connection", (socket) => {
 
   socket.emit("ready", { socketId: socket.id });
 
+  socket.on("set-location", (payload, callback) => {
+    const user = users.get(socket.id);
+
+    if (!user) return;
+    if (!validateLocation(payload)) {
+      callback?.({ ok: false, error: "Invalid location." });
+      return;
+    }
+
+    // Only store coordinates server-side for matching.
+    // Never send these coordinates to another user.
+    user.location = {
+      lat: Number(payload.lat),
+      lng: Number(payload.lng),
+      countryCode: typeof payload.countryCode === "string"
+        ? payload.countryCode.slice(0, 2).toUpperCase()
+        : null
+    };
+
+    callback?.({ ok: true });
+  });
+
   socket.on("find-stranger", (callback) => {
     const user = users.get(socket.id);
 
-    if (!user) {
-      callback?.({ ok: false, error: "User session not found." });
+    if (!user?.location) {
+      callback?.({ ok: false, error: "Location is required before matching." });
       return;
     }
 
@@ -188,12 +236,19 @@ io.on("connection", (socket) => {
       return;
     }
 
-    const matched = startSearching(socket);
+    user.searching = true;
+    waiting.add(socket.id);
+
+    const matched = tryMatch(socket.id);
 
     callback?.({
       ok: true,
       searching: !matched
     });
+
+    if (!matched) {
+      socket.emit("searching", { message: "Looking for someone nearby..." });
+    }
   });
 
   socket.on("next", () => {
@@ -219,8 +274,12 @@ io.on("connection", (socket) => {
       socket.emit("chat-ended");
     }
 
-    waiting.delete(socket.id);
-    startSearching(socket);
+    user.searching = true;
+    waiting.add(socket.id);
+
+    if (!tryMatch(socket.id)) {
+      socket.emit("searching", { message: "Looking for another person..." });
+    }
   });
 
   socket.on("leave", () => {
@@ -250,14 +309,12 @@ io.on("connection", (socket) => {
 
   socket.on("message", (payload, callback) => {
     const user = users.get(socket.id);
-
     if (!user?.roomId) {
       callback?.({ ok: false, error: "You are not in a chat." });
       return;
     }
 
-    const text =
-      typeof payload?.text === "string" ? payload.text.trim() : "";
+    const text = typeof payload?.text === "string" ? payload.text.trim() : "";
 
     if (!text) {
       callback?.({ ok: false, error: "Message is empty." });
@@ -296,6 +353,9 @@ io.on("connection", (socket) => {
     set.add(partnerId);
     blocked.set(socket.id, set);
 
+    socket.emit("blocked");
+
+    // End current chat and immediately look for another person.
     const roomId = user.roomId;
     removeFromRoom(socket.id);
 
@@ -307,9 +367,12 @@ io.on("connection", (socket) => {
     partnerSocket?.emit("partner-left");
 
     socket.leave(roomId);
-    socket.emit("blocked");
+    user.searching = true;
+    waiting.add(socket.id);
 
-    startSearching(socket);
+    if (!tryMatch(socket.id)) {
+      socket.emit("searching", { message: "Looking for another person..." });
+    }
   });
 
   socket.on("report", (payload) => {
@@ -358,5 +421,5 @@ io.on("connection", (socket) => {
 });
 
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`NearChat server running on port ${PORT}`);
+  console.log(`NearChat server running on http://localhost:${PORT}`);
 });
