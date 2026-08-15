@@ -1,33 +1,31 @@
-# NearChat — simplest Vercel + Render deployment
+# NearChat — Global Random Chat
 
-This version intentionally puts the React/Vite app at the repository root.
+NearChat now matches **any available online user**. Location is completely removed.
 
-That means **Vercel does NOT need a Root Directory setting**.
+## What changed
 
-## GitHub structure
+- No browser location permission
+- No GPS/geolocation code
+- No nearby/radius filtering
+- No distance shown
+- Any two waiting online users can be matched
+- Matching is randomized
+- Next Stranger
+- Leave chat
+- Typing indicator
+- Report
+- Block
 
-```text
-near-chat/
-├── package.json
-├── index.html
-├── vite.config.ts
-├── tsconfig.json
-├── vercel.json
-├── src/
-└── server/
-    ├── package.json
-    └── src/
-        └── server.js
-```
+Socket.IO provides the real-time bidirectional connection used for chat. citeturn0search1
 
 ## Vercel
 
-Import this repository.
+This repository is structured so the React/Vite app is at the root.
 
 Use:
 
-- Framework Preset: Vite
-- Root Directory: `./` (repository root)
+- Framework: Vite
+- Root Directory: `./`
 - Build Command: `npm run build`
 - Output Directory: `dist`
 - Install Command: `npm install`
@@ -40,9 +38,7 @@ VITE_SERVER_URL=https://YOUR-RENDER-SERVICE.onrender.com
 
 ## Render
 
-Create a Web Service.
-
-Use:
+Create a Web Service:
 
 - Root Directory: `server`
 - Build Command: `npm install`
@@ -51,19 +47,19 @@ Use:
 Environment variable:
 
 ```text
-CLIENT_ORIGIN=https://YOUR-VERCEL-DOMAIN.vercel.app
+CLIENT_ORIGIN=https://YOUR-VERCEL-APP.vercel.app
 ```
 
-## Local
+## Local development
 
-Frontend:
+Terminal 1:
 
 ```bash
 npm install
 npm run dev
 ```
 
-Backend:
+Terminal 2:
 
 ```bash
 cd server
@@ -71,10 +67,20 @@ npm install
 npm run dev
 ```
 
-## Why this version is simpler
+## Test
 
-The previous project had the frontend under `client/`. That requires Vercel's Root Directory to be configured correctly.
+Open the Vercel URL in two different browsers/devices.
 
-This version puts `index.html` and `package.json` directly at the repository root, so Vercel can detect the Vite application automatically.
+Click:
 
-The backend remains under `server/` and is deployed separately to Render.
+**Find Random Stranger**
+
+in both.
+
+The first user waits. When the second user clicks the button, the server matches them.
+
+## Important
+
+This is still an MVP. Matching state is held in server memory. If the Render process restarts, the waiting queue is cleared.
+
+For a public production service, add Redis, persistent reports/blocks, authentication or anonymous durable identities, rate limits, abuse detection, moderation, and age/safety controls.
