@@ -1,19 +1,69 @@
-# NearChat
+# NearChat — simplest Vercel + Render deployment
 
-Omegle-style 1-to-1 text chat that prioritizes nearby users.
+This version intentionally puts the React/Vite app at the repository root.
 
-## Deployment
+That means **Vercel does NOT need a Root Directory setting**.
 
-This repository is prepared for:
+## GitHub structure
 
-- Vercel → React frontend
-- Render → Node.js + Socket.IO backend
+```text
+near-chat/
+├── package.json
+├── index.html
+├── vite.config.ts
+├── tsconfig.json
+├── vercel.json
+├── src/
+└── server/
+    ├── package.json
+    └── src/
+        └── server.js
+```
 
-See `DEPLOYMENT.md`.
+## Vercel
 
-## Local development
+Import this repository.
 
-Server:
+Use:
+
+- Framework Preset: Vite
+- Root Directory: `./` (repository root)
+- Build Command: `npm run build`
+- Output Directory: `dist`
+- Install Command: `npm install`
+
+Environment variable:
+
+```text
+VITE_SERVER_URL=https://YOUR-RENDER-SERVICE.onrender.com
+```
+
+## Render
+
+Create a Web Service.
+
+Use:
+
+- Root Directory: `server`
+- Build Command: `npm install`
+- Start Command: `npm start`
+
+Environment variable:
+
+```text
+CLIENT_ORIGIN=https://YOUR-VERCEL-DOMAIN.vercel.app
+```
+
+## Local
+
+Frontend:
+
+```bash
+npm install
+npm run dev
+```
+
+Backend:
 
 ```bash
 cd server
@@ -21,22 +71,10 @@ npm install
 npm run dev
 ```
 
-Client:
+## Why this version is simpler
 
-```bash
-cd client
-npm install
-npm run dev
-```
+The previous project had the frontend under `client/`. That requires Vercel's Root Directory to be configured correctly.
 
-For local development, copy:
+This version puts `index.html` and `package.json` directly at the repository root, so Vercel can detect the Vite application automatically.
 
-```text
-client/.env.example → client/.env
-```
-
-and use:
-
-```text
-VITE_SERVER_URL=http://localhost:4000
-```
+The backend remains under `server/` and is deployed separately to Render.

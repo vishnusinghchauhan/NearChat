@@ -8,5 +8,3 @@ services:
     envVars:
       - key: CLIENT_ORIGIN
         sync: false
-      - key: PORT
-        value: 10000
