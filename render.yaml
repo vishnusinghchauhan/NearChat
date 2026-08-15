@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: near-chat-server
+    runtime: node
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: CLIENT_ORIGIN
+        sync: false
+      - key: PORT
+        value: 10000
